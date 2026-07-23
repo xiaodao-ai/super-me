@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+backend/__pycache__/
+backend/data/
+*.pyc
+.DS_Store
+.canvas-snap.jpg
+.preview-*.png
+node_modules/
+projects/
+workspace/

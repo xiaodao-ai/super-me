@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>超级个体 · Super Me</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <canvas id="gpu"></canvas>
+
+  <!-- DOM 覆盖层：标签 / 气泡 / 面板 -->
+  <div id="overlay"></div>
+
+  <header id="topbar">
+    <div id="brand">
+      <span class="logo">🫧</span>
+      <div>
+        <h1>超级个体 <small>SUPER&nbsp;ME</small></h1>
+        <p>真实 Agent 小队：TL 真实拆解 · 成员真实产出（Qoder SDK 驱动）</p>
+      </div>
+    </div>
+    <div id="clockCard">
+      <span id="dayLabel">Day 1</span>
+      <span id="clockLabel">07:00</span>
+      <span id="phasePill">☀️ 起床</span>
+      <label id="gateCtl" title="同时运行的 qodercli 会话上限（全局）">🚦
+        <select id="gateSel">
+          <option value="1">并发 1</option>
+          <option value="2">并发 2</option>
+          <option value="3">并发 3</option>
+          <option value="4">并发 4</option>
+          <option value="6">并发 6</option>
+          <option value="8">并发 8</option>
+        </select>
+        <span id="gateLive"></span>
+      </label>
+      <button id="manageAgentsBtn" class="miniBtn" title="管理自定义 Agent">➕ Agent</button>
+    </div>
+  </header>
+
+  <aside id="roster"></aside>
+
+  <aside id="eventCard">
+    <div id="projBoard"></div>
+    <h2>📡 协作动态</h2>
+    <div id="evtFilters">
+      <button data-f="all" class="on">全部</button>
+      <button data-f="done" title="完成">✅</button>
+      <button data-f="accept" title="验收">👑</button>
+      <button data-f="rework" title="返工">🔁</button>
+      <button data-f="flow" title="任务流转">📮</button>
+    </div>
+    <ul id="eventList"></ul>
+  </aside>
+
+  <section id="detailCard" class="hidden">
+    <button id="detailClose">✕</button>
+    <div id="detailHead"></div>
+    <div id="detailTodos"></div>
+  </section>
+
+  <section id="publishCard">
+    <div class="pubTabs">
+      <button id="tabTask" class="on">📮 派任务</button>
+      <button id="tabProj">🗂 发项目</button>
+    </div>
+    <div id="taskForm">
+      <div class="pubRow">
+        <select id="pubAssignee"></select>
+      </div>
+      <div class="pubRow">
+        <input id="pubTitle" type="text" maxlength="40"
+               placeholder="任务内容，如：做一个登录页" />
+        <button id="pubBtn">发布</button>
+      </div>
+      <p id="pubHint">发给 TL：真实 LLM 拆解后分派执行；产出在 workspace/</p>
+    </div>
+    <div id="projForm" class="hidden">
+      <div class="pubRow">
+        <input id="projTitle" type="text" maxlength="60"
+               placeholder="项目名称，如：个人博客系统" />
+      </div>
+      <div class="pubRow">
+        <div id="projFolderWrap">
+          <span>📁 projects/</span>
+          <input id="projFolder" type="text" maxlength="40"
+                 placeholder="文件夹名（留空自动生成）" />
+        </div>
+      </div>
+      <div class="pubRow">
+        <textarea id="projDesc" rows="3" maxlength="800"
+          placeholder="项目描述：目标、功能点、验收标准…（队长会据此规划步骤）"></textarea>
+      </div>
+      <div class="pubRow">
+        <label style="font-size:12px;color:var(--ink-soft);margin-bottom:4px">参与成员（TL 必选）</label>
+        <div id="projMembers" class="projMembers"></div>
+      </div>
+      <div class="pubRow">
+        <button id="projBtn" style="flex:1">🚀 立项，交给队长督导推进</button>
+      </div>
+      <p id="pubHint2">队长规划步骤 → 成员分步执行 → 队长每步点评督促直到结项</p>
+    </div>
+    <p id="pubMsg"></p>
+  </section>
+
+  <div id="settingsBackdrop" class="hidden"></div>
+  <section id="settingsCard" class="hidden">
+    <button id="settingsClose">✕</button>
+    <div id="settingsHead"></div>
+    <div class="setField">
+      <label>📁 专属工作目录
+        <button id="dirBrowseBtn" class="miniBtn">📂 浏览选择</button>
+      </label>
+      <input id="setWorkdir" type="text"
+             placeholder="留空 = 任务默认目录 workspace/task-N" />
+      <div id="dirPicker" class="hidden">
+        <div id="dirShortcuts"></div>
+        <div id="dirCurrent"></div>
+        <div id="dirList"></div>
+        <div class="dirActions">
+          <button id="dirUp" class="miniBtn">⬆️ 上一级</button>
+          <button id="dirPick" class="miniBtn primary">✅ 就选这个目录</button>
+        </div>
+      </div>
+      <small>支持绝对路径、~、或相对项目根的路径；保存时自动创建</small>
+    </div>
+    <div class="setField">
+      <label>🧩 可使用的 Skill
+        <span class="skillAllWrap"><input type="checkbox" id="setSkillAll" />全部启用</span>
+      </label>
+      <div id="setSkills" class="skillList"></div>
+    </div>
+    <div class="setField">
+      <label>📜 附加规则 Rules</label>
+      <textarea id="setRules" rows="4"
+        placeholder="例如：所有代码注释用中文；产出文件名用 kebab-case；禁止引入外部 CDN…"></textarea>
+    </div>
+    <div class="setField" id="learnedField">
+      <label>🧠 自学规则（复盘自动沉淀，可删除）</label>
+      <div id="learnedList"></div>
+    </div>
+    <div class="setRow">
+      <div class="setField" style="flex:1.2">
+        <label>🧠 指定模型</label>
+        <select id="setModel"><option value="">默认（Auto）</option></select>
+      </div>
+      <div class="setField" style="flex:0.8">
+        <label>📏 上下文窗口</label>
+        <select id="setCtx"><option value="">默认</option></select>
+      </div>
+    </div>
+    <div class="setRow">
+      <label class="bashToggle" title="开启后该分身可以执行终端命令（npm/git/运行测试等），能力更强但风险更高">
+        <input type="checkbox" id="setBash" />允许执行 Shell 命令
+        <small>可运行 npm / git / 测试等，默认关闭更安全</small>
+      </label>
+    </div>
+    <div class="setActions">
+      <button id="setSave">保存配置</button>
+      <span id="setMsg"></span>
+    </div>
+    <hr class="setSep"/>
+    <div class="setCronSection">
+      <h4>⏰ 定时任务</h4>
+      <div id="setCronList"></div>
+      <div class="cronForm">
+        <div class="cronRow">
+          <label>间隔</label>
+          <input id="cronInterval" type="number" min="1" max="1440" value="5" />
+          <span>分钟</span>
+        </div>
+        <div class="cronRow">
+          <label>时间窗口</label>
+          <input id="cronWindows" type="text" placeholder="如 09:00-12:00,14:00-18:00（空=全天）" />
+        </div>
+        <div class="cronRow">
+          <textarea id="cronPrompt" rows="2" maxlength="500" placeholder="每次触发时执行的指令…"></textarea>
+        </div>
+        <button id="cronAddBtn">➕ 添加定时任务</button>
+        <span id="cronMsg"></span>
+      </div>
+    </div>
+  </section>
+
+  <div id="askBackdrop" class="hidden"></div>
+  <section id="askCard" class="hidden">
+    <div id="askHead"></div>
+    <div id="askBody"></div>
+    <div class="askActions">
+      <button id="askSkip">⏭ 跳过，让队长自己拿主意</button>
+      <button id="askSubmit">✅ 提交回答</button>
+    </div>
+    <p id="askMsg"></p>
+  </section>
+
+  <div id="projDetailBackdrop" class="hidden"></div>
+  <section id="projDetailCard" class="hidden">
+    <button id="projDetailClose">✕</button>
+    <div id="projDetailHead"></div>
+    <div id="projDetailBody"></div>
+  </section>
+
+  <div id="termBackdrop" class="hidden"></div>
+  <section id="termCard" class="hidden">
+    <button id="termClose">✕</button>
+    <div id="termHead"></div>
+    <div id="termTools">
+      <select id="termFilter"><option value="">全部会话</option></select>
+      <label id="termFollow"><input type="checkbox" id="termFollowCk" checked />自动滚动</label>
+    </div>
+    <div id="termBody"></div>
+    <div id="termInterject">
+      <input id="interjectInput" type="text" maxlength="200"
+             placeholder="💬 插话纠正：执行中会立刻中断并按你的话调整…" />
+      <button id="interjectBtn">发送</button>
+    </div>
+  </section>
+
+  <div id="noGpu" class="hidden">
+    <div>
+      <h2>😢 当前浏览器不支持 WebGPU</h2>
+      <p>请使用最新版 Chrome / Edge / Safari 打开</p>
+    </div>
+  </div>
+
+  <!-- Agent 管理弹窗 -->
+  <div id="agentMgrBackdrop" class="backdrop hidden"></div>
+  <section id="agentMgrCard" class="modal hidden">
+    <button id="agentMgrClose">✕</button>
+    <h3>管理自定义 Agent</h3>
+    <div id="agentMgrList"></div>
+    <hr/>
+    <h4>新增 Agent</h4>
+    <div class="agentForm">
+      <input id="agentNewId" type="text" maxlength="20" placeholder="id（英文小写，如 designer）" />
+      <input id="agentNewName" type="text" maxlength="20" placeholder="名称（如 设计师）" />
+      <input id="agentNewEmoji" type="text" maxlength="4" placeholder="emoji（如 🎨）" />
+      <input id="agentNewRole" type="text" maxlength="40" placeholder="角色描述（如 UI/UX 设计）" />
+      <textarea id="agentNewSys" rows="2" maxlength="500" placeholder="系统提示词（可留空用默认）"></textarea>
+      <button id="agentNewBtn">➕ 添加</button>
+      <p id="agentNewMsg"></p>
+    </div>
+  </section>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>
