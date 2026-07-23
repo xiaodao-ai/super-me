@@ -665,8 +665,12 @@ class TaskRunner:
                 w.log(f"🔧 {agent.spec['emoji']} {agent.spec['name']} 开始「{sub.title}」"
                       + (f"（模型：{model}）" if model else ""))
             w.dirty = True
+            abs_workdir = str((self.ws_root.parent / task.workdir).resolve())
             prompt = (f"子任务：{sub.title}\n具体要求：{sub.brief}\n"
-                      f"（所属需求：{task.title}。请在当前目录产出真实文件。）"
+                      f"（所属需求：{task.title}）\n"
+                      f"工作目录（绝对路径）：{abs_workdir}\n"
+                      f"所有产出文件必须直接写入该工作目录，禁止另建任务目录/子文件夹，"
+                      f"也不要把文件写到工作目录之外。"
                       + getattr(task, "clarify_ctx", ""))
             if rework_note:
                 prompt += (f"\n\n【队长终验未通过，这是第 "

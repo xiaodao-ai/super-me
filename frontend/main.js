@@ -80,6 +80,11 @@ addEventListener("resize", () => renderer.resize());
 const t0 = performance.now();
 let lastT = t0;
 
+// 渲染帧率上限：每帧全量重建几何体成本较高，高刷屏上无节流的 rAF
+// 会跑到 120fps 白白吃 CPU。限制到 ~30fps，这类俯视风格视觉几乎无差别。
+const FRAME_MS = 1000 / 30;
+let lastFrame = 0;
+
 // 页面隐藏时 rAF 不触发，降级用定时器驱动；可见性切换时接管调度，
 // 并通过取消旧句柄保证只存在一条调度链
 let rafId = 0, toId = 0;
@@ -94,6 +99,9 @@ document.addEventListener("visibilitychange", schedule);
 function loop(now) {
   schedule();
   if (window.__pauseRender) return;
+  // 帧率节流：距上一帧不足一个帧间隔就跳过重建与渲染（rAF 回调本身很轻）
+  if (now - lastFrame < FRAME_MS - 0.5) return;
+  lastFrame = now;
   const time = (now - t0) / 1000;
   const dt = Math.min((now - lastT) / 1000, 0.1);
   lastT = now;

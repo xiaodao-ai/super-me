@@ -1,0 +1,9 @@
+# super-me 后端依赖
+# 安装：python3 -m pip install -r requirements.txt
+# 国内镜像：python3 -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+
+# Web 服务 / WebSocket 广播
+aiohttp>=3.13,<4
+
+# 驱动分身真实执行任务的 Agent SDK（自动带入 mcp、pydantic 等依赖）
+qoder-agent-sdk>=1.0.9
