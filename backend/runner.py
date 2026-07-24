@@ -14,16 +14,19 @@ import os
 import pathlib
 import re
 import time
+import traceback
 
-from qoder_agent_sdk import query, QoderAgentOptions, qodercli_auth
+from qoder_agent_sdk import query, QoderAgentOptions, qodercli_auth, QoderSDKClient
+from qoder_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
 import agent_config
 import project_memory
+import run_log
 from personas import (
     MEETING_CENTER, TL_SPLIT_PROMPT, LEADER_ID,
-    PROJECT_PLAN_PROMPT, PROJECT_ACCEPT_PROMPT, TASK_ACCEPT_PROMPT,
+    PROJECT_PLAN_PROMPT, PROJECT_EXTEND_PROMPT, PROJECT_ACCEPT_PROMPT, TASK_ACCEPT_PROMPT,
     CLARIFY_PROMPT, EVOLVE_PROMPT, MEMBER_ASK_NOTE, TL_ANSWER_PROMPT,
-    PROJECT_MEMORY_PROMPT,
+    PROJECT_MEMORY_PROMPT, JSON_FIX_PROMPT,
 )
 from world import Subtask, PStep, PAssign
 
@@ -31,12 +34,11 @@ VALID_ROLES = ("dev", "qa", "reviewer")       # 内置角色（动态角色通�
 WRITE_TOOLS = ("write", "edit", "multiedit", "searchreplace",
                "write_file", "edit_file", "create_file")
 MAX_REWORK = 2                   # 每个验收点最多打回返工轮数
-# 验收会话允许 TL 读文件，但禁止任何写操作与 Bash（覆盖大小写命名差异）
-READONLY_DISALLOWED = [
-    "Bash", "Write", "Edit", "MultiEdit", "SearchReplace",
-    "write", "edit", "multiedit", "searchreplace",
-    "write_file", "edit_file", "create_file",
-]
+
+# ── 执行会话超时策略（双阀值：硬上限 + 空闲卡死检测）──
+EXEC_HARD_TIMEOUT = 1200         # 执行会话硬上限 20 分钟（绝对天花板，防死循环）
+EXEC_IDLE_TIMEOUT = 240          # 空闲超时 4 分钟：无工具执行且流持续静默超此时长=卡死，提前停
+IDLE_CHECK_INTERVAL = 10         # 空闲检测轮询间隔（秒）
 
 
 class GlobalGate:
@@ -184,11 +186,10 @@ class TaskRunner:
             tl.activity = "🤔 审题中"
             tl.stream_tag = f"{kind_label}#{obj.id} 澄清"
             try:
-                text = await self._query_text(
+                data = await self._query_json(
                     CLARIFY_PROMPT.format(kind=kind_label, title=title,
                                           desc=desc or "（无）"),
                     tl, timeout=180)
-                data = self._parse_json(text)
                 qs = []
                 for q in data.get("questions", [])[:3]:
                     if q.get("q"):
@@ -197,8 +198,10 @@ class TaskRunner:
                             "options": [str(o)[:60]
                                         for o in q.get("options", [])][:4],
                         })
-            except Exception:
+            except Exception as e:
                 qs = []      # 澄清失败不阻塞，按原需求执行
+                tl.push_stream("error", f"✖ 澄清阶段异常：{type(e).__name__}: {str(e)[:120]}")
+                w.log(f"⚠️ 澄清阶段 LLM 异常，按原需求执行（{type(e).__name__}: {str(e)[:60]}）")
             finally:
                 tl.activity = ""
 
@@ -334,11 +337,10 @@ class TaskRunner:
                 context = (f"{kind_label}「{obj.title}」"
                            + (f"：{obj.desc[:200]}" if getattr(obj, "desc", "") else "")
                            + getattr(obj, "clarify_ctx", ""))
-                text = await self._query_text(
+                data = await self._query_json(
                     TL_ANSWER_PROMPT.format(name=agent.spec["name"],
                                             context=context, question=question),
                     tl, timeout=180)
-                data = self._parse_json(text)
             except Exception:
                 data = {}
             finally:
@@ -388,11 +390,10 @@ class TaskRunner:
             async with self.locks[LEADER_ID]:
                 tl.activity = "🧠 复盘沉淀中"
                 tl.stream_tag = f"复盘·{title[:10]}"
-                text = await self._query_text(
+                data = await self._query_json(
                     EVOLVE_PROMPT.format(kind=kind, title=title,
                                          context=context), tl, timeout=180)
                 tl.activity = ""
-            data = self._parse_json(text)
             for r in data.get("rules", [])[:4]:
                 role, rule = r.get("role"), (r.get("rule") or "").strip()
                 if role not in list(VALID_ROLES) + [LEADER_ID] or not rule:
@@ -404,8 +405,10 @@ class TaskRunner:
                     w.log(f"🧠 自进化：{m.spec['emoji']} {m.spec['name']} 学到新规则「{rule[:70]}」")
                     m.say("学到了，下次注意！📝", 7)
             w.dirty = True
-        except Exception:
-            tl.activity = ""       # 复盘失败静默跳过，不影响交付
+        except Exception as e:
+            tl.activity = ""
+            tl.push_stream("error", f"✖ 复盘阶段异常：{type(e).__name__}: {str(e)[:120]}")
+            w.log(f"⚠️ 复盘阶段 LLM 异常，跳过本次自进化（{type(e).__name__}: {str(e)[:60]}）")
 
     @staticmethod
     def _has_signal(*groups):
@@ -473,25 +476,27 @@ class TaskRunner:
             async with self.locks[LEADER_ID]:
                 tl.activity = "📝 沉淀项目记忆"
                 tl.stream_tag = f"项目「{proj.title[:10]}」记忆"
-                text = await self._query_text(
+                data = await self._query_json(
                     PROJECT_MEMORY_PROMPT.format(
                         title=proj.title, desc=proj.desc or "（无）",
                         extra=extra, existing=existing),
                     tl, timeout=180)
                 tl.activity = ""
-            data = self._parse_json(text)
             items = data.get("memories", [])[:4]
             added = project_memory.add_batch(pdir, items)
             if added:
                 w.log(f"📝 项目「{proj.title}」沉淀了 {added} 条项目记忆")
                 tl.say(f"记下了 {added} 条项目经验 📝", 6)
             w.dirty = True
-        except Exception:
-            tl.activity = ""       # 记忆沉淀失败静默跳过，不影响交付
+        except Exception as e:
+            tl.activity = ""
+            tl.push_stream("error", f"✖ 项目记忆沉淀异常：{type(e).__name__}: {str(e)[:120]}")
+            w.log(f"⚠️ 项目记忆沉淀异常，跳过本次沉淀（{type(e).__name__}: {str(e)[:60]}）")
 
     # ── 入口 ──────────────────────────────────────────────
     async def run(self, task):
         w = self.world
+        _logtok = run_log.push_context(task=task.id)
         try:
             # 开工前澄清：TL 有疑问就先问用户
             task.clarify_ctx = await self._clarify(
@@ -518,6 +523,12 @@ class TaskRunner:
 
             task.status = "running"
             w.dirty = True
+            try:
+                run_log.write("lifecycle", event="task_start", id=task.id,
+                              title=task.title, assignee=task.assignee,
+                              subtasks=len(task.subtasks), workdir=task.workdir)
+            except Exception:
+                pass
             for stage in sorted({s.stage for s in task.subtasks}):
                 batch = [s for s in task.subtasks if s.stage == stage]
                 await asyncio.gather(*(self._run_subtask(task, s) for s in batch))
@@ -530,6 +541,13 @@ class TaskRunner:
             task.status = "failed" if failed else "done"
             task.finished = time.time()
             files = sorted(p.name for p in workdir.iterdir() if p.is_file())
+            try:
+                run_log.write("lifecycle", event="task_end", id=task.id,
+                              title=task.title, status=task.status,
+                              secs=round((task.finished or 0) - (task.created or 0), 1),
+                              failed=len(failed), files=files[:12])
+            except Exception:
+                pass
             if failed:
                 w.log(f"⚠️ 任务「{task.title}」部分失败（{len(failed)}/{len(task.subtasks)}）")
             else:
@@ -540,8 +558,14 @@ class TaskRunner:
             task.status = "failed"
             task.error = str(e)[:200]
             w.log(f"❌ 任务「{task.title}」异常：{str(e)[:80]}")
+            try:
+                run_log.write("exception", where="run_task", id=task.id,
+                              err=str(e)[:300], trace=traceback.format_exc()[:4000])
+            except Exception:
+                pass
         finally:
             w.dirty = True
+            run_log.pop_context(_logtok)
 
     # ── 已完成任务的追问（原班人马在原目录继续）────────────
     async def followup_task(self, task, message):
@@ -609,11 +633,10 @@ class TaskRunner:
             tl.say(f"收到需求「{task.title}」，我来拆解")
             w.log(f"👑 队长桑开始拆解「{task.title}」（真实 LLM 调用）")
             try:
-                text = await self._query_text(
+                data = await self._query_json(
                     TL_SPLIT_PROMPT.format(title=task.title)
                     + getattr(task, "clarify_ctx", ""),
                     tl, timeout=240)
-                data = self._parse_json(text)
                 subs = []
                 for d in data.get("subtasks", [])[:4]:
                     role = d.get("role")
@@ -665,12 +688,8 @@ class TaskRunner:
                 w.log(f"🔧 {agent.spec['emoji']} {agent.spec['name']} 开始「{sub.title}」"
                       + (f"（模型：{model}）" if model else ""))
             w.dirty = True
-            abs_workdir = str((self.ws_root.parent / task.workdir).resolve())
             prompt = (f"子任务：{sub.title}\n具体要求：{sub.brief}\n"
-                      f"（所属需求：{task.title}）\n"
-                      f"工作目录（绝对路径）：{abs_workdir}\n"
-                      f"所有产出文件必须直接写入该工作目录，禁止另建任务目录/子文件夹，"
-                      f"也不要把文件写到工作目录之外。"
+                      f"（所属需求：{task.title}。请在当前目录产出真实文件。）"
                       + getattr(task, "clarify_ctx", ""))
             if rework_note:
                 prompt += (f"\n\n【队长终验未通过，这是第 "
@@ -681,7 +700,7 @@ class TaskRunner:
             try:
                 summary = await self._execute_with_qa(
                     prompt, agent, sub, "task", task,
-                    cwd=self.ws_root.parent / task.workdir, timeout=600,
+                    cwd=self.ws_root.parent / task.workdir, timeout=EXEC_HARD_TIMEOUT,
                     # TL 拆解的多人协作任务必须在任务目录聚合文件；
                     # 只有用户直接指派的单人任务才使用成员专属目录；
                     # 追问会话固定在原任务目录
@@ -698,6 +717,12 @@ class TaskRunner:
                 sub.status = "failed"
                 sub.summary = f"失败：{str(e)[:150]}"
                 w.log(f"❌ {agent.spec['emoji']} {agent.spec['name']} 「{sub.title}」失败：{str(e)[:60]}")
+                try:
+                    run_log.write("exception", where="subtask", role=sub.role,
+                                  title=sub.title, err=str(e)[:300],
+                                  trace=traceback.format_exc()[:4000])
+                except Exception:
+                    pass
                 agent.say("呜，这个任务翻车了…", 6)
             finally:
                 sub.finished = time.time()
@@ -711,6 +736,7 @@ class TaskRunner:
     async def run_project(self, proj):
         w = self.world
         tl = w.by_id[LEADER_ID]
+        _logtok = run_log.push_context(proj=proj.id)
         try:
             # 立项前澄清：TL 有疑问就先问用户
             proj.clarify_ctx = await self._clarify(
@@ -735,14 +761,13 @@ class TaskRunner:
                 w.dirty = True
                 try:
                     proj_roles = self._valid_roles(proj.members)
-                    text = await self._query_text(
+                    data = await self._query_json(
                         PROJECT_PLAN_PROMPT.format(
                             title=proj.title, desc=proj.desc or "（无补充描述）",
                             project_dir=abs_pdir,
                             members_desc=self._members_desc(proj.members))
                         + getattr(proj, "clarify_ctx", ""),
                         tl, timeout=300)
-                    data = self._parse_json(text)
                     steps = []
                     for sd in data.get("steps", [])[:4]:
                         assigns = [PAssign(a["role"], a.get("brief", "")[:300])
@@ -776,6 +801,12 @@ class TaskRunner:
             # 3) 逐步推进：执行 → 队长验收 → 不合格打回返工 → 通过才放行
             proj.status = "running"
             w.dirty = True
+            try:
+                run_log.write("lifecycle", event="project_start", id=proj.id,
+                              title=proj.title, steps=len(proj.steps),
+                              members=sorted(roles), dir=proj.dir)
+            except Exception:
+                pass
             for i, step in enumerate(proj.steps):
                 step.status = "running"
                 w.log(f"📍 项目步骤 {i + 1}/{len(proj.steps)}「{step.title}」启动")
@@ -793,6 +824,12 @@ class TaskRunner:
                     proj.status = "failed"
                     proj.error = f"步骤「{step.title}」有 {len(failed)} 个任务失败"
                     w.log(f"⚠️ 项目「{proj.title}」在步骤 {i + 1} 受阻，队长暂停推进")
+                    try:
+                        run_log.write("lifecycle", event="project_end", id=proj.id,
+                                      title=proj.title, status="failed",
+                                      stuck_step=i + 1, error=proj.error)
+                    except Exception:
+                        pass
                     return
                 # 每步验收通过后沉淀项目记忆
                 step_extra = (f"刚完成步骤 {i + 1}「{step.title}」，"
@@ -802,6 +839,13 @@ class TaskRunner:
             proj.finished = time.time()
             shared = sorted(p.name for p in (pdir / "shared").iterdir()
                             if p.is_file())
+            try:
+                run_log.write("lifecycle", event="project_end", id=proj.id,
+                              title=proj.title, status="done",
+                              secs=round((proj.finished or 0) - (proj.created or 0), 1),
+                              steps=len(proj.steps), shared=shared[:12])
+            except Exception:
+                pass
             w.log(f"🏁 项目「{proj.title}」全部完成！shared/ 交付：{'、'.join(shared[:8]) or '见项目目录'}")
             tl.say(f"项目「{proj.title}」顺利结项！🎊", 8)
             # 结项时最终沉淀一次项目记忆（汇总全局视角）
@@ -814,9 +858,151 @@ class TaskRunner:
             proj.error = str(e)[:200]
             w.log(f"❌ 项目「{proj.title}」异常：{str(e)[:80]}")
             tl.say("项目推进遇到问题了…", 6)
+            try:
+                run_log.write("exception", where="run_project", id=proj.id,
+                              err=str(e)[:300], trace=traceback.format_exc()[:4000])
+            except Exception:
+                pass
         finally:
             self.proj_tasks.pop(proj.id, None)
             w.dirty = True
+            run_log.pop_context(_logtok)
+
+    # ── 项目追加需求：已完成项目上追加新需求，队长重新拆解继续做
+    async def extend_project(self, proj, message):
+        """对已完成的项目追加新需求：TL 规划新增步骤（接续已有产出），继续推进。"""
+        w = self.world
+        tl = w.by_id[LEADER_ID]
+        if proj.status != "done":
+            return
+        pdir = self.ws_root.parent / proj.dir if proj.dir else None
+        if not pdir or not pdir.is_dir():
+            proj.error = "项目目录不存在，无法追加需求"
+            w.dirty = True
+            return
+        _logtok = run_log.push_context(proj=proj.id)
+        abs_pdir = str(pdir.resolve())
+        base_idx = len(proj.steps)          # 新步骤从这里往后追加
+        proj.status = "planning"
+        proj.finished = None
+        proj.error = ""
+        w.dirty = True
+        try:
+            # 1) TL 基于已有产出 + 项目记忆，为追加需求规划新增步骤
+            async with self.locks[LEADER_ID]:
+                tl.state = "meeting"
+                tl.go(*MEETING_CENTER)
+                tl.activity = "📋 追加需求规划中"
+                tl.stream_tag = f"项目「{proj.title[:10]}」追加规划"
+                tl.say(f"「{proj.title}」有新需求，我来规划新步骤", 8)
+                w.log(f"➕ 项目「{proj.title}」追加需求：{message[:40]}")
+                w.dirty = True
+                try:
+                    proj_roles = self._valid_roles(proj.members)
+                    done_steps = "\n".join(
+                        f"- 步骤{i + 1}「{s.title}」（{s.status}）"
+                        for i, s in enumerate(proj.steps)) or "（无）"
+                    try:
+                        deliv = "、".join(sorted(
+                            p.name for p in (pdir / "shared").iterdir()
+                            if p.is_file())) or "（空）"
+                    except OSError:
+                        deliv = "（空）"
+                    mem = project_memory.format_for_prompt(pdir) or "（无）"
+                    data = await self._query_json(
+                        PROJECT_EXTEND_PROMPT.format(
+                            title=proj.title, project_dir=abs_pdir,
+                            members_desc=self._members_desc(proj.members),
+                            done_steps=done_steps, deliverables=deliv,
+                            memory=mem, message=message),
+                        tl, timeout=300)
+                    new_steps = []
+                    for sd in data.get("steps", [])[:3]:
+                        assigns = [PAssign(a["role"], a.get("brief", "")[:300])
+                                   for a in sd.get("assignments", [])[:3]
+                                   if a.get("role") in proj_roles]
+                        if sd.get("title") and assigns:
+                            new_steps.append(PStep(sd["title"][:60], assigns))
+                    if not new_steps:
+                        raise ValueError("追加规划结果为空")
+                    proj.steps.extend(new_steps)
+                finally:
+                    tl.state = "idle"
+                    tl.activity = ""
+                    tl.go_desk()
+
+            # 2) 补建新增角色的个人目录 + 追写 PROJECT.md + desc
+            new_steps = proj.steps[base_idx:]
+            roles = {a.role for s in new_steps for a in s.assigns}
+            for r in roles:
+                (pdir / "members" / r).mkdir(parents=True, exist_ok=True)
+            proj.desc = (proj.desc + f"\n\n【追加需求】{message}")[:2000]
+            extra_md = [f"\n\n## 追加需求（{time.strftime('%m-%d %H:%M')}）",
+                        message, "", "### 新增步骤"]
+            for j, s in enumerate(new_steps):
+                extra_md.append(f"\n#### 步骤 {base_idx + j + 1}：{s.title}")
+                extra_md += [f"- [{a.role}] {a.brief}" for a in s.assigns]
+            try:
+                with (pdir / "PROJECT.md").open("a", encoding="utf-8") as f:
+                    f.write("\n".join(extra_md))
+            except OSError:
+                pass
+            w.log(f"📋 追加规划完成：新增 {len(new_steps)} 个步骤")
+            tl.say(f"新增 {len(new_steps)} 步，继续推进！", 6)
+
+            # 3) 执行新增步骤（与 run_project 同款：执行→验收→返工→沉淀）
+            proj.status = "running"
+            w.dirty = True
+            try:
+                run_log.write("lifecycle", event="project_extend", id=proj.id,
+                              title=proj.title, add_steps=len(new_steps),
+                              from_step=base_idx + 1, message=message[:120])
+            except Exception:
+                pass
+            for i in range(base_idx, len(proj.steps)):
+                step = proj.steps[i]
+                step.status = "running"
+                w.log(f"📍 项目步骤 {i + 1}/{len(proj.steps)}「{step.title}」启动")
+                for a in step.assigns:
+                    w.add_link(LEADER_ID, a.role, step.title[:14])
+                w.dirty = True
+                await asyncio.gather(
+                    *(self._run_passign(proj, step, a, pdir) for a in step.assigns))
+                failed = [a for a in step.assigns if a.status != "done"]
+                if not failed:
+                    await self._accept_step(proj, i, step, pdir)
+                    failed = [a for a in step.assigns if a.status != "done"]
+                step.status = "failed" if failed else "done"
+                if failed:
+                    proj.status = "failed"
+                    proj.error = f"步骤「{step.title}」有 {len(failed)} 个任务失败"
+                    w.log(f"⚠️ 项目「{proj.title}」在追加步骤 {i + 1} 受阻")
+                    return
+                step_extra = (f"追加步骤 {i + 1}「{step.title}」完成，"
+                              f"队长验收：{step.review[:150]}")
+                await self._evolve_project_memory(proj, pdir, extra=step_extra)
+            proj.status = "done"
+            proj.finished = time.time()
+            shared = sorted(p.name for p in (pdir / "shared").iterdir()
+                            if p.is_file())
+            w.log(f"🏁 项目「{proj.title}」追加需求完成！shared/：{'、'.join(shared[:8]) or '见目录'}")
+            tl.say(f"「{proj.title}」追加需求也搞定了！🎊", 8)
+            await self._evolve_project_memory(
+                proj, pdir, extra=f"完成追加需求：{message[:120]}")
+        except Exception as e:
+            proj.status = "failed"
+            proj.error = str(e)[:200]
+            w.log(f"❌ 项目「{proj.title}」追加需求异常：{str(e)[:80]}")
+            tl.say("追加需求推进遇到问题了…", 6)
+            try:
+                run_log.write("exception", where="extend_project", id=proj.id,
+                              err=str(e)[:300], trace=traceback.format_exc()[:4000])
+            except Exception:
+                pass
+        finally:
+            self.proj_tasks.pop(proj.id, None)
+            w.dirty = True
+            run_log.pop_context(_logtok)
 
     # ── 项目失败后重试：从失败的步骤继续执行 ───────────
     async def retry_project(self, proj, hint=""):
@@ -850,9 +1036,11 @@ class TaskRunner:
         try:
             for i in range(start_idx, len(proj.steps)):
                 step = proj.steps[i]
-                # 重置失败的子任务状态
+                # 重置本步骤内未完成的子任务（!= done 均重跑）：
+                # 除 failed 外，还要覆盖服务重启遗留的 running 僵尸状态，
+                # 否则重置不到 → redo 为空 → 不跑任务直接判失败（零耗时秒挂）。
                 for a in step.assigns:
-                    if a.status == "failed":
+                    if a.status != "done":
                         a.status = "pending"
                         a.summary = ""
                 step.status = "running"
@@ -920,6 +1108,7 @@ class TaskRunner:
             # 注入项目记忆：让 Agent 快速感知项目上下文
             mem_ctx = project_memory.format_for_prompt(pdir)
             abs_pdir = str(pdir.resolve())
+            app_root = str(self.ws_root.parent.resolve())
             prompt = (
                 f"项目：{proj.title}\n项目描述：{proj.desc or '无'}\n"
                 f"当前步骤：{step.title}\n你的任务：{assign.brief}\n\n"
@@ -928,7 +1117,10 @@ class TaskRunner:
                 f"- 最终交付物写入：{abs_pdir}/shared/\n"
                 f"- 个人草稿放入：{abs_pdir}/members/{assign.role}/\n"
                 f"先阅读 {abs_pdir}/shared/ 里已有的产出再动手。\n"
-                f"❗目录约束：你只能在 {abs_pdir} 内操作，严禁 cd 到其他目录或在项目外读写文件。\n"
+                f"❗目录铁律（违反视为交付失败）：\n"
+                f"  1) 你只能在 {abs_pdir} 内操作，严禁 cd/读/写到该目录之外。\n"
+                f"  2) ☠️ {app_root} 是本系统（调度器）自身的代码仓库，严禁进入、读取、或对它执行任何 git 命令。\n"
+                f"  3) git 操作只能针对你 clone 到 {abs_pdir} 内的仓库；若 git 报“不在仓库”，说明还没拉代码，先 clone 到项目内，不要向上找仓库。\n"
                 f"❗路径要求：所有文件操作必须使用绝对路径（如 {abs_pdir}/shared/xxx.html），"
                 f"不要使用相对路径。总结产出时也请写明绝对路径。\n\n"
                 f"此前进展：\n{done_ctx}"
@@ -943,7 +1135,7 @@ class TaskRunner:
             try:
                 summary = await self._execute_with_qa(
                     prompt, agent, assign, "project", proj,
-                    cwd=pdir, timeout=600, force_cwd=True)
+                    cwd=pdir, timeout=EXEC_HARD_TIMEOUT, force_cwd=True)
                 assign.status = "done"
                 assign.rework_note = ""
                 assign.summary = (summary or "已完成")[:200]
@@ -962,41 +1154,181 @@ class TaskRunner:
                 agent.hints = []          # 插话只作用于本次执行
                 w.dirty = True
 
-    async def _tl_verdict(self, prompt, cwd):
-        """TL 真实验收：打开 cwd 下交付文件检查后裁决。超时自动重试一次。
-        返回 (verdict, comment, rework)。"""
+    # ── 交付物真实证据采集（供 TL 验收中作硬判据）────
+    @staticmethod
+    def _count_lines(p):
+        """快速数文件行数；>512KB 的大文件直接跳过。"""
+        try:
+            if p.stat().st_size > 512 * 1024:
+                return None
+            with p.open("rb") as f:
+                return sum(1 for _ in f)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _read_preview(p, max_lines=80, max_chars=4000):
+        """读文本文件预览：返回 (text_or_None, note)。
+        二进制/非文本返回 (None, note)；截断时在 note 里标明。"""
+        try:
+            raw = p.read_bytes()[:max_chars * 4 + 512]   # 留一些余量防 UTF-8 多字节
+        except Exception as e:
+            return None, f"读取失败：{type(e).__name__}"
+        if b"\x00" in raw[:2048]:
+            return None, "二进制文件"
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                text = raw.decode("gbk", errors="replace")
+            except Exception:
+                return None, "非文本编码"
+        lines = text.splitlines()
+        truncated = False
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            truncated = True
+        text = "\n".join(lines)
+        if len(text) > max_chars:
+            text = text[:max_chars]
+            truncated = True
+        return text, ("已截断" if truncated else "全文")
+
+    def _collect_evidence(self, root, roles=None, mode="project"):
+        """采集交付目录的磁盘真实证据，返回 (evidence_text, is_empty)。
+        mode="project"：列 shared/ 与 members/<role>/（项目模式目录规范）
+        mode="task"：列 root/ 下所有文件（任务模式无分层）
+        is_empty=True 表示关键交付目录缺失/为空，供上层短路直接打回。
+        产出文件会内联内容预览（默认单文件 ≤ 80 行/4KB），代付总预算 30KB。"""
+        if not root or not root.is_dir():
+            return "⚠ 工作目录不存在或已被删除", True
+        lines = []
+        is_empty = False
+        budget = [30000]      # 用列表包一层供闭包修改
+
+        def _append_preview(p):
+            if budget[0] <= 200:
+                lines.append("    （证据预算已耗尽，本文件内容未展示）")
+                return
+            preview, note = self._read_preview(p)
+            if preview is None:
+                lines.append(f"    （{note}，无法预览）")
+                return
+            if len(preview) > budget[0] - 200:
+                preview = preview[:max(200, budget[0] - 200)] + "\n…（因总预算截断）"
+                note = "因总预算截断"
+            lines.append(f"    <<<{p.name}（{note}）>>>")
+            for ln in preview.splitlines():
+                lines.append("    " + ln)
+            lines.append(f"    <<<END {p.name}>>>")
+            budget[0] -= len(preview) + 60
+
+        if mode == "project":
+            shared = root / "shared"
+            if not shared.is_dir():
+                lines.append("shared/：❌ 目录不存在（未交付）")
+                is_empty = True
+            else:
+                files = sorted(p for p in shared.iterdir() if p.is_file())
+                if not files:
+                    lines.append("shared/：❌ 空目录（无任何交付物）")
+                    is_empty = True
+                else:
+                    lines.append(f"shared/（共 {len(files)} 个文件）：")
+                    for p in files[:20]:
+                        n = self._count_lines(p)
+                        lines.append(
+                            f"  - {p.name}（{p.stat().st_size} 字节"
+                            + (f"，{n} 行" if n is not None else "") + "）")
+                        _append_preview(p)
+                    if len(files) > 20:
+                        lines.append(f"  …还有 {len(files) - 20} 个文件未列出")
+            # members/ 目录：只列文件名（草稿非核心判据，不读内容以省预算）
+            mroot = root / "members"
+            if mroot.is_dir():
+                role_dirs = sorted(p for p in mroot.iterdir() if p.is_dir())
+                if roles:
+                    role_dirs = [p for p in role_dirs if p.name in roles]
+                for rd in role_dirs:
+                    rfiles = sorted(p for p in rd.iterdir() if p.is_file())
+                    if not rfiles:
+                        lines.append(f"members/{rd.name}/：（空）")
+                    else:
+                        detail = "、".join(
+                            f"{p.name}({p.stat().st_size}B)" for p in rfiles[:5])
+                        if len(rfiles) > 5:
+                            detail += f" 等 {len(rfiles)} 个"
+                        lines.append(f"members/{rd.name}/：{detail}")
+        else:      # task 模式
+            files = sorted(p for p in root.iterdir() if p.is_file())
+            if not files:
+                lines.append("工作目录：❌ 空（无任何交付物）")
+                is_empty = True
+            else:
+                lines.append(f"工作目录（共 {len(files)} 个文件）：")
+                for p in files[:20]:
+                    n = self._count_lines(p)
+                    lines.append(
+                        f"  - {p.name}（{p.stat().st_size} 字节"
+                        + (f"，{n} 行" if n is not None else "") + "）")
+                    _append_preview(p)
+                if len(files) > 20:
+                    lines.append(f"  …还有 {len(files) - 20} 个文件未列出")
+        return "\n".join(lines), is_empty
+
+    async def _tl_verdict(self, prompt, fallback_roles=()):
+        """TL 真实验收：返回 (verdict, comment, rework)。超时自动重试一次；
+        连续 2 次异常 → 保守判 rework 而非放行（异常不可静默跨过）。
+        fallback_roles：LLM 判 rework 但没给成员时、或异常兑底时，用它构造 rework 列表。"""
         tl = self.world.by_id[LEADER_ID]
+
+        def _fill_rework(instr):
+            return [{"role": r, "instruction": instr[:300]}
+                    for r in sorted(fallback_roles or [])]
+
         for attempt in range(2):   # 最多尝试 2 次
             try:
-                text = await self._query_review(prompt, tl, cwd=cwd, timeout=300)
-                data = self._parse_json(text)
+                data = await self._query_json(prompt, tl, timeout=300)
                 verdict = "rework" if data.get("verdict") == "rework" else "pass"
-                comment = str(data.get("comment", ""))[:300]
+                comment = str(data.get("comment", ""))[:400]
                 rework = [r for r in data.get("rework", [])
                           if r.get("role") in self._valid_roles()
                           and r.get("instruction")][:3]
                 if verdict == "rework" and not rework:
-                    verdict = "pass"        # 没给整改对象就当通过
+                    # 保守：LLM 判 rework 却没给对象 → 全员打回而非放行
+                    if fallback_roles:
+                        rework = _fill_rework(
+                            "队长判定本步不达标但未指名具体整改点，请对照证据重新自检并补齐交付")
+                        self.world.log("⚠️ 队长判 rework 但未指名成员，按全员整改处理")
+                    else:
+                        verdict = "pass"    # 无候选成员兑底，只能视为通过
                 return verdict, comment, rework
             except Exception as e:
+                err = f"{type(e).__name__}: {str(e)[:100]}"
                 if attempt == 0:
-                    tl.push_stream("info", f"⚠ 验收第 1 次失败（{type(e).__name__}），重试中…")
+                    tl.push_stream("info", f"⚠ 验收第 1 次失败（{err}），重试中…")
                     self.world.dirty = True
-                    await asyncio.sleep(2)   # 短暂等待后重试
+                    await asyncio.sleep(2)
                     continue
-                # 第 2 次仍失败：视为通过但记录警告
-                self.world.log(f"⚠️ 队长验收超时/异常，视为通过（{str(e)[:60]}）")
-                return "pass", f"（验收超时，视为通过：{str(e)[:80]}）", []
-        return "pass", "（验收异常，视为通过）", []
+                # 两次都失败 → 不再默默放行，保守判 rework
+                tl.push_stream("error", f"✖ 验收 2 次连续异常，保守判 rework：{err}")
+                self.world.log(f"⚠️ 验收连续异常，保守判 rework（{err}）")
+                comment = f"验收 LLM 连续 2 次异常（{err}），保守判 rework 以避免误放行"
+                rework = _fill_rework(
+                    f"上一轮验收因 LLM 异常未完成（{err}），请照证据重新自检并补齐交付")
+                return "rework", comment, rework
+        # 无法到达（避免逸出）
+        return "rework", "验收异常", _fill_rework("请重新自检并补齐交付")
 
     async def _accept_step(self, proj, idx, step, pdir):
         """队长验收本步骤；不合格则带整改意见打回返工，最多 MAX_REWORK 轮。"""
         w = self.world
         tl = w.by_id[LEADER_ID]
+        step_roles = {a.role for a in step.assigns}
         for rnd in range(1, MAX_REWORK + 2):
             final_round = rnd > MAX_REWORK
             summaries = "\n".join(
-                f"- {w.by_id[a.role].spec['name']}（{a.status}）：{a.summary[:100]}"
+                f"- {w.by_id[a.role].spec['name']}（{a.status}）：{a.summary}"
                 for a in step.assigns)
             rest = [s.title for s in proj.steps[idx + 1:]]
             remaining = ("剩余步骤：" + "、".join(rest)) if rest else "这是最后一步。"
@@ -1004,27 +1336,44 @@ class TaskRunner:
                            "只能输出 pass，并在 comment 中记录遗留问题。"
                            if final_round else
                            (f"这是第 {rnd - 1} 次返工后的复验。" if rnd > 1 else ""))
-            async with self.locks[LEADER_ID]:
-                tl.state = "meeting"
-                tl.go(*MEETING_CENTER)
-                tl.activity = "🧐 验收产出中"
-                tl.stream_tag = f"项目「{proj.title[:10]}」步骤{idx + 1}验收"
-                verdict, comment, rework = await self._tl_verdict(
-                    PROJECT_ACCEPT_PROMPT.format(
-                        title=proj.title, idx=idx + 1, total=len(proj.steps),
-                        step=step.title, summaries=summaries,
-                        remaining=remaining, rework_note=rework_note,
-                        project_dir=str(pdir.resolve())),
-                    cwd=pdir)
-                tl.state = "idle"
-                tl.activity = ""
-                tl.go_desk()
+            # 采集磁盘真实证据（最高优先级判据）
+            evidence, is_empty = self._collect_evidence(
+                pdir, roles=step_roles, mode="project")
+            # 空交付短路：非终轮时不再麻烦 LLM，直接打回返工
+            if is_empty and not final_round:
+                verdict = "rework"
+                comment = "shared/ 目录为空或不存在（磁盘证据），交付物缺失"
+                rework = [{"role": r,
+                           "instruction": (f"必须把本步骤应交付的文件写入 "
+                                           f"{pdir.resolve()}/shared/ 目录（使用绝对路径）")}
+                          for r in sorted(step_roles)]
+                tl.push_stream("info", "🚫 空交付直接打回（磁盘证据）")
+                w.log(f"👑 空交付 → 免验直接打回（步骤 {idx + 1}）")
+                w.dirty = True
+            else:
+                async with self.locks[LEADER_ID]:
+                    tl.state = "meeting"
+                    tl.go(*MEETING_CENTER)
+                    tl.activity = "🧐 验收产出中"
+                    tl.stream_tag = f"项目「{proj.title[:10]}」步骤{idx + 1}验收"
+                    verdict, comment, rework = await self._tl_verdict(
+                        PROJECT_ACCEPT_PROMPT.format(
+                            title=proj.title, idx=idx + 1, total=len(proj.steps),
+                            step=step.title, summaries=summaries,
+                            evidence=evidence,
+                            remaining=remaining, rework_note=rework_note,
+                            project_dir=str(pdir.resolve())),
+                        fallback_roles=step_roles)
+                    tl.state = "idle"
+                    tl.activity = ""
+                    tl.go_desk()
             step.review = comment
             try:
                 with (pdir / "PROJECT_LOG.md").open("a", encoding="utf-8") as f:
                     f.write(f"\n## 步骤 {idx + 1}：{step.title}"
                             f"（第 {rnd} 轮验收：{verdict}）\n"
-                            f"{summaries}\n\n**队长验收**：{comment}\n")
+                            f"{summaries}\n\n【交付证据】\n{evidence}\n\n"
+                            f"**队长验收**：{comment}\n")
             except Exception:
                 pass
             w.dirty = True
@@ -1061,30 +1410,43 @@ class TaskRunner:
         """TL 拆解任务的交付终验；不合格打回对应成员返工，最多 MAX_REWORK 轮。"""
         w = self.world
         tl = w.by_id[LEADER_ID]
+        task_roles = {s.role for s in task.subtasks}
+        workdir = (self.ws_root.parent / task.workdir) if task.workdir else None
         for rnd in range(1, MAX_REWORK + 2):
             final_round = rnd > MAX_REWORK
             summaries = "\n".join(
-                f"- {w.by_id[s.role].spec['name']}「{s.title}」（{s.status}）：{s.summary[:100]}"
+                f"- {w.by_id[s.role].spec['name']}「{s.title}」（{s.status}）：{s.summary}"
                 for s in task.subtasks)
             rework_note = (f"注意：已返工 {rnd - 1} 次，达到上限，"
                            "只能输出 pass，并在 comment 中记录遗留问题。"
                            if final_round else
                            (f"这是第 {rnd - 1} 次返工后的复验。" if rnd > 1 else ""))
-            async with self.locks[LEADER_ID]:
-                tl.state = "meeting"
-                tl.go(*MEETING_CENTER)
-                tl.activity = "🧐 交付终验中"
-                tl.stream_tag = f"任务#{task.id} 终验"
-                task_dir = self.ws_root.parent / task.workdir
-                verdict, comment, rework = await self._tl_verdict(
-                    TASK_ACCEPT_PROMPT.format(title=task.title,
-                                              summaries=summaries,
-                                              rework_note=rework_note,
-                                              workdir=str(task_dir.resolve())),
-                    cwd=task_dir)
-                tl.state = "idle"
-                tl.activity = ""
-                tl.go_desk()
+            # 采集磁盘真实证据（最高优先级判据）
+            evidence, is_empty = self._collect_evidence(workdir, mode="task")
+            if is_empty and not final_round:
+                verdict = "rework"
+                comment = "工作目录为空或不存在（磁盘证据），交付物缺失"
+                rework = [{"role": r,
+                           "instruction": (f"必须在工作目录 "
+                                           f"{workdir if workdir else '（未设置）'} 内产出真实文件")}
+                          for r in sorted(task_roles)]
+                tl.push_stream("info", "🚫 空交付直接打回（磁盘证据）")
+                w.log(f"👑 空交付 → 免验直接打回（任务「{task.title}」）")
+            else:
+                async with self.locks[LEADER_ID]:
+                    tl.state = "meeting"
+                    tl.go(*MEETING_CENTER)
+                    tl.activity = "🧐 交付终验中"
+                    tl.stream_tag = f"任务#{task.id} 终验"
+                    verdict, comment, rework = await self._tl_verdict(
+                        TASK_ACCEPT_PROMPT.format(title=task.title,
+                                                  summaries=summaries,
+                                                  evidence=evidence,
+                                                  rework_note=rework_note),
+                        fallback_roles=task_roles)
+                    tl.state = "idle"
+                    tl.activity = ""
+                    tl.go_desk()
             w.dirty = True
             if verdict == "pass":
                 w.log(f"👑 终验通过 ✅「{task.title}」"
@@ -1113,11 +1475,93 @@ class TaskRunner:
             if any(s.status != "done" for s in redo):
                 return
 
+    # ── 越界硬门禁：把工具操作限制在项目/任务目录内 ─────
+    @staticmethod
+    def _path_within(root, p):
+        """判断路径 p 是否在 root 之内（含 root 本身）。相对路径按 root 解析。
+        解析失败按越界处理（保守拒绝）。"""
+        try:
+            root_r = pathlib.Path(root).resolve()
+            pp = pathlib.Path(p).expanduser()
+            if not pp.is_absolute():
+                pp = root_r / pp
+            pp = pp.resolve()
+            return pp == root_r or root_r in pp.parents
+        except Exception:
+            return False
+
+    @staticmethod
+    def _bash_escapes(command, root):
+        """检查 bash 命令是否越出 root 边界。越界返回原因串，否则 None。
+        规则：① cd/pushd 目标不得在 root 外；② 不得访问 root 外的用户空间路径
+        （~ 或 /Users/、/home/ 下）。系统路径（/usr /bin /tmp 等）放行以便运行工具。"""
+        import shlex
+        try:
+            tokens = shlex.split(command)
+        except Exception:
+            tokens = command.split()
+        for i, tok in enumerate(tokens):
+            if tok in ("cd", "pushd") and i + 1 < len(tokens):
+                target = tokens[i + 1]
+                if target in ("&&", "||", ";", "|", "&"):
+                    continue
+                if not TaskRunner._path_within(root, target):
+                    return f"cd 到项目外目录：{target}"
+        for tok in tokens:
+            if "://" in tok:            # URL，非本地路径
+                continue
+            val = tok
+            if val.startswith("-") and "=" in val:   # 形如 --file=/abs/path
+                val = val.split("=", 1)[1]
+            if val.startswith("~") or val.startswith("/Users/") or val.startswith("/home/"):
+                if not TaskRunner._path_within(root, val):
+                    return f"访问项目外用户空间路径：{val}"
+        return None
+
+    def _make_boundary_guard(self, root, agent):
+        """生成 can_use_tool 回调：越出 root 边界的 bash/文件操作一律拒绝。"""
+        root_s = str(pathlib.Path(root).resolve())
+
+        async def guard(tool_name, tool_input, context):
+            reason = None
+            try:
+                name = (tool_name or "").lower()
+                inp = tool_input or {}
+                if name == "bash" or "shell" in name or "terminal" in name:
+                    cmd = inp.get("command") or inp.get("cmd") or ""
+                    if isinstance(cmd, str) and cmd.strip():
+                        reason = self._bash_escapes(cmd, root_s)
+                else:
+                    for k, v in inp.items():
+                        if "path" in k.lower() and isinstance(v, str) and v:
+                            if not self._path_within(root_s, v):
+                                reason = f"{tool_name} 访问项目外路径：{v}"
+                                break
+            except Exception:
+                reason = None      # 守卫自身异常不误伤（放行并记录）
+                self.world.log("⚠️ 越界守卫内部异常，放行本次工具调用")
+            if reason:
+                agent.push_stream("error", f"🚫 拦截越界：{reason}")
+                self.world.log(f"🚫 {agent.spec['emoji']} {agent.spec['name']} 越界被拦：{reason[:70]}")
+                try:
+                    run_log.write("boundary_deny", agent=agent.id,
+                                  tool=tool_name, reason=reason, root=root_s)
+                except Exception:
+                    pass
+                self.world.dirty = True
+                return PermissionResultDeny(
+                    message=(f"越界被拒：{reason}。你只能在项目目录 {root_s} 内操作，"
+                             "严禁访问该目录之外（尤其禁止碰调度器自身的代码仓库）。请改用项目内路径。"),
+                    interrupt=False)
+            return PermissionResultAllow()
+
+        return guard
+
     # ── SDK 调用 ─────────────────────────────────────────
-    def _opts(self, agent, cwd, allow_tools, force_cwd=False, read_only=False):
+    def _opts(self, agent, cwd, allow_tools, force_cwd=False):
         """组装会话配置：应用该分身的个人配置（目录/skills/rules/模型/上下文/Bash）。
         force_cwd=True 时（项目模式）忽略个人专属目录，保证项目文件聚合。
-        read_only=True 时（验收模式）放开读文件工具，但禁止写操作与 Bash。"""
+        allow_tools=True 时启用越界硬门禁（can_use_tool + default 权限模式）。"""
         cfg = agent_config.get(agent.id)
         # 专属工作目录优先于任务目录（项目模式除外）
         if allow_tools and not force_cwd:
@@ -1139,19 +1583,48 @@ class TaskRunner:
         extra = {}
         if cfg.get("context"):
             extra["context-window"] = str(cfg["context"])
+        # 越界硬门禁 + 防御纵深：仅对“带工具执行”的成员会话生效
+        env = {}
+        can_use_tool = None
+        perm_mode = "bypassPermissions"
+        skip_perm = True
+        if allow_tools:
+            # ① GIT_CEILING 挡住 git 向上走出工作目录（env 合并进继承环境，不覆盖 PATH）
+            try:
+                env["GIT_CEILING_DIRECTORIES"] = str(pathlib.Path(cwd).resolve().parent)
+            except Exception:
+                pass
+            # ② can_use_tool 硬门禁：越出 cwd 的 bash/文件操作一律拒绝。
+            #    default 模式下 CLI 才会把权限决策交给回调（bypass 会跳过）
+            can_use_tool = self._make_boundary_guard(cwd, agent)
+            perm_mode = "default"
+            skip_perm = False
+        def _cli_err(line, _aid=agent.id):
+            # 内置 CLI 的 stderr 收进日志（而非刷控制台），便于排障
+            s = str(line).strip()
+            if s:
+                try:
+                    run_log.write("cli_stderr", agent=_aid, txt=s[:500])
+                except Exception:
+                    pass
         return QoderAgentOptions(
             auth=qodercli_auth(),
             cwd=str(cwd),
             system_prompt=sys or None,
             tools=None if allow_tools else [],
-            disallowed_tools=(list(READONLY_DISALLOWED) if read_only
-                              else ([] if cfg["allow_bash"] else ["Bash"])),
-            permission_mode="bypassPermissions",
-            allow_dangerously_skip_permissions=True,
+            disallowed_tools=[] if cfg["allow_bash"] else ["Bash"],
+            permission_mode=perm_mode,
+            allow_dangerously_skip_permissions=skip_perm,
+            can_use_tool=can_use_tool,
             model=cfg["model"] or None,
             skills=skills,
+            env=env,
+            stderr=_cli_err,
             extra_args=extra,
-            max_turns=(15 if read_only else (30 if allow_tools else 1)),
+            # 所有会话（成员执行 + TL 思考）都开流式增量：模型每吐一段 token 都发
+            # StreamEvent，供 idle 守护刷新活动时钟，从而把“真在思考”与“真 hang”区分开。
+            include_partial_messages=True,
+            max_turns=30 if allow_tools else 1,
         )
 
     async def _query_text(self, prompt, agent, timeout):
@@ -1160,67 +1633,68 @@ class TaskRunner:
         agent.push_stream("info", f"▶ 思考会话：{prompt.strip().splitlines()[0][:60]}")
 
         async def consume():
-            self._gate_note(agent)
-            async with self.gate:      # 全局并发闸门
-                opts = self._opts(agent, self.ws_root, allow_tools=False)
-                async for msg in query(prompt=prompt, options=opts):
-                    n = type(msg).__name__
-                    if n == "AssistantMessage":
-                        for b in getattr(msg, "content", []):
-                            if hasattr(b, "text") and b.text.strip():
-                                chunks.append(b.text)
-                                agent.push_stream("text", b.text.strip())
-                    elif n == "ResultMessage":
-                        agent.push_stream("result",
-                                          f"■ 会话结束（{getattr(msg, 'subtype', '?')}）")
+            opts = self._opts(agent, self.ws_root, allow_tools=False)
+            async for msg in query(prompt=prompt, options=opts):
+                n = type(msg).__name__
+                if n == "AssistantMessage":
+                    for b in getattr(msg, "content", []):
+                        if hasattr(b, "text") and b.text.strip():
+                            chunks.append(b.text)
+                            agent.push_stream("text", b.text.strip())
+                elif n == "StreamEvent":
+                    # 模型正在流式吐字：刷新活动时钟，让长思考不被误判为卡死。
+                    agent.last_activity = time.monotonic()
+                elif n == "ResultMessage":
+                    agent.push_stream("result",
+                                      f"■ 会话结束（{getattr(msg, 'subtype', '?')}）")
 
+        self._gate_note(agent)
+        async with self.gate:          # 先占并发额度再计时：排队等待不计入超时预算
+            task = asyncio.ensure_future(consume())
+            try:
+                # 与成员会话同款的流式空闲守护：有流式产出就续等，只在持续静默才判卡死；
+                # hard 给足空间，避免固定超时误杀“真在思考”的长会话。
+                await self._await_with_idle_guard(
+                    task, agent,
+                    hard_timeout=max(timeout, EXEC_IDLE_TIMEOUT + 120),
+                    idle_timeout=EXEC_IDLE_TIMEOUT)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                agent.push_stream("error", f"✖ {type(e).__name__}: {str(e)[:120]}")
+                raise
+            finally:
+                if not task.done():
+                    task.cancel()
+        resp = "".join(chunks)
+        # 捕获本次 LLM 调用的完整 prompt 与原始响应（验收/拆解/解析出错时最关键的取证）
         try:
-            await asyncio.wait_for(consume(), timeout)
-        except Exception as e:
-            agent.push_stream("error", f"✖ {type(e).__name__}: {str(e)[:120]}")
-            raise
-        return "".join(chunks)
+            run_log.write("llm", agent=agent.id, purpose=agent.stream_tag,
+                          prompt=prompt[:6000], response=resp[:4000])
+        except Exception:
+            pass
+        return resp
 
-    async def _query_review(self, prompt, agent, cwd, timeout):
-        """带只读文件工具的验收会话：TL 真实打开交付目录检查产物后再裁决。"""
-        chunks = []
-        agent.push_stream(
-            "info", f"▶ 验收会话（可查阅文件）：{prompt.strip().splitlines()[0][:50]}")
-
-        async def consume():
-            self._gate_note(agent)
-            async with self.gate:      # 全局并发闸门
-                opts = self._opts(agent, cwd, allow_tools=True,
-                                  force_cwd=True, read_only=True)
-                async for msg in query(prompt=prompt, options=opts):
-                    n = type(msg).__name__
-                    if n == "AssistantMessage":
-                        for b in getattr(msg, "content", []):
-                            bn = type(b).__name__
-                            if bn == "TextBlock" and b.text.strip():
-                                chunks.append(b.text)
-                                agent.push_stream("text", b.text.strip())
-                            elif bn == "ToolUseBlock":
-                                name = getattr(b, "name", "tool")
-                                inp = getattr(b, "input", None) or {}
-                                fname = ""
-                                for k, v in inp.items():
-                                    if "path" in k.lower() and isinstance(v, str):
-                                        fname = os.path.basename(v)
-                                        break
-                                agent.activity = f"🔍 查阅 {fname}".strip()
-                                agent.push_stream("tool", f"{name} {fname}".strip())
-                                self.world.dirty = True
-                    elif n == "ResultMessage":
-                        agent.push_stream(
-                            "result", f"■ 验收会话结束（{getattr(msg, 'subtype', '?')}）")
-
+    async def _query_json(self, prompt, agent, timeout):
+        """查询并解析 JSON；本地修复（_parse_json）失败时，再调一次 LLM 把上次
+        输出重排成标准 JSON。最多一次额外重排调用，有界不死循环。
+        解析仍失败则抛 ValueError（由调用方按各自策略处理）。"""
+        text = await self._query_text(prompt, agent, timeout)
         try:
-            await asyncio.wait_for(consume(), timeout)
-        except Exception as e:
-            agent.push_stream("error", f"✖ {type(e).__name__}: {str(e)[:120]}")
-            raise
-        return "".join(chunks)
+            return self._parse_json(text)
+        except ValueError as first_err:
+            # 本地修复兵不住 → 请 LLM 把这段输出重排成严格 JSON
+            agent.push_stream("info", "⚠ 输出非标准 JSON，请 LLM 重新格式化…")
+            self.world.dirty = True
+            try:
+                fixed = await self._query_text(
+                    JSON_FIX_PROMPT.format(bad=text[:2000]),
+                    agent, min(timeout, 150))
+            except Exception:
+                raise first_err        # 重排调用本身失败（超时等），抛原始解析错
+            data = self._parse_json(fixed)   # 若再失败，抛新的 ValueError
+            agent.push_stream("info", "✅ LLM 重排后解析成功")
+            return data
 
     async def _execute(self, prompt, agent, sub, cwd, timeout, force_cwd=False):
         """带文件工具的真实执行，实时回传活动与流式日志。"""
@@ -1232,10 +1706,12 @@ class TaskRunner:
 
         async def consume():
             nonlocal last_text
-            self._gate_note(agent)
-            async with self.gate:      # 全局并发闸门
-                opts = self._opts(agent, cwd, allow_tools=True, force_cwd=force_cwd)
-                async for msg in query(prompt=prompt, options=opts):
+            opts = self._opts(agent, cwd, allow_tools=True, force_cwd=force_cwd)
+            client = QoderSDKClient(options=opts)
+            await client.connect()
+            try:
+                await client.query(prompt)
+                async for msg in client.receive_response():
                     n = type(msg).__name__
                     if n == "AssistantMessage":
                         for b in getattr(msg, "content", []):
@@ -1253,19 +1729,22 @@ class TaskRunner:
                                     if "path" in k.lower() and isinstance(v, str):
                                         fname = os.path.basename(v)
                                         break
-                                if not fname:      # 无路径参数时展示主要入参
+                                if not fname:      # 无路径参数时展示主要入参（存较完整命令，前端做折叠/滞动展示）
                                     for k in ("command", "query", "pattern", "prompt"):
                                         if isinstance(inp.get(k), str):
-                                            brief = inp[k][:60]
+                                            brief = inp[k][:2000]
                                             break
                                 if fname and name.lower() in WRITE_TOOLS \
                                         and fname not in sub.files:
                                     sub.files.append(fname)
                                 agent.activity = f"🔧 {name} {fname}".strip()
+                                agent.pending_tool = name   # 标记工具执行中：此期间静默属正常（如 git clone），豁免空闲检测
+                                agent.pending_tool_since = time.monotonic()  # 记工具起始时刻，供心跳展示工具自身耗时
                                 agent.push_stream("tool", f"{name} {fname or brief}".strip())
                                 w.dirty = True
                     elif n == "UserMessage":
                         # 工具执行结果回传（截断展示）
+                        agent.pending_tool = ""          # 工具已返回，解除豁免
                         for b in getattr(msg, "content", []) or []:
                             if type(b).__name__ == "ToolResultBlock":
                                 c = getattr(b, "content", "")
@@ -1279,23 +1758,189 @@ class TaskRunner:
                         agent.push_stream("result", f"■ 会话结束（{sb}）")
                         if sb != "success":
                             raise RuntimeError(f"会话结束异常：{sb}")
+                    elif n == "StreamEvent":
+                        # 模型正在流式吐字（思考/生成中）：直接刷新空闲时钟，
+                        # 让“真在思考”与“真 hang（零 StreamEvent）”区分开，避免误杀长思考。
+                        # （此信号来自 CLI 真实产出，非自造心跳，刷它不会重蹈心跳续命的覆辙。）
+                        agent.last_activity = time.monotonic()
+                    elif n == "ToolProgressMessage":
+                        # 长工具（如 git clone）进度心跳：同样算“还活着”。
+                        agent.last_activity = time.monotonic()
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
 
-        exec_task = asyncio.ensure_future(consume())
-        agent.exec_task = exec_task          # 供用户插话时中断
-        try:
-            await asyncio.wait_for(exec_task, timeout)
-        except Exception as e:
-            if not isinstance(e, asyncio.CancelledError):
+        self._gate_note(agent)
+        async with self.gate:          # 先占并发额度再计时：排队等待不计入执行超时预算
+            exec_task = asyncio.ensure_future(consume())
+            agent.exec_task = exec_task          # 供用户插话时中断
+            try:
+                await self._await_with_idle_guard(
+                    exec_task, agent,
+                    hard_timeout=timeout, idle_timeout=EXEC_IDLE_TIMEOUT)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
                 agent.push_stream("error", f"✖ {type(e).__name__}: {str(e)[:120]}")
-            raise
-        finally:
-            agent.exec_task = None
+                raise
+            finally:
+                agent.exec_task = None
         return last_text
+
+    async def _await_with_idle_guard(self, exec_task, agent,
+                                     hard_timeout, idle_timeout):
+        """监控等待执行任务：根据执行状态决定继续等还是提前停。
+        - 只要还在产出（流事件刷新 last_activity）或有工具在执行（pending_tool 非空），就继续等
+        - 无工具执行且流持续静默超 idle_timeout → 判定卡死，取消并抛超时
+        - 总时长超 hard_timeout → 硬上限，取消并抛超时
+        正常完成时返回（内部异常会由 result() 向上抛）。"""
+        start = time.monotonic()
+        agent.last_activity = start
+        agent.pending_tool = ""
+        agent.pending_tool_since = start
+        last_note = 0.0                  # 上次提示"长时间执行中"的时间，避免刷屏
+        while True:
+            done, _ = await asyncio.wait({exec_task}, timeout=IDLE_CHECK_INTERVAL)
+            if done:
+                return exec_task.result()    # 正常完成（或内部异常向上抛）
+            now = time.monotonic()
+            elapsed = now - start
+            idle = now - agent.last_activity
+            # ① 硬上限：绝对天花板，防死循环
+            if elapsed >= hard_timeout:
+                await self._cancel_and_drain(exec_task)
+                agent.push_stream(
+                    "error",
+                    f"✖ 执行会话达硬上限 {int(hard_timeout)}s 仍未完成，已强制停止"
+                    f"（可在设置中调大超时或把任务拆细）")
+                raise TimeoutError(f"执行会话达硬上限 {int(hard_timeout)}s 未完成")
+            # ② 空闲卡死：无工具执行 + 流持续静默
+            if not agent.pending_tool and idle >= idle_timeout:
+                await self._cancel_and_drain(exec_task)
+                agent.push_stream(
+                    "error",
+                    f"✖ 执行会话静默 {int(idle)}s 无任何产出，判定卡死，已提前停止")
+                raise TimeoutError(f"执行会话静默 {int(idle)}s 卡死")
+            # 还在执行（有工具或刚有过产出）：继续等，周期性播报进展
+            if elapsed - last_note >= 60:
+                last_note = elapsed
+                # 会话时钟与工具时钟分开表述：避免把"会话累计耗时"误读成"当前工具已跑这么久"
+                if agent.pending_tool:
+                    busy = f"当前工具 {agent.pending_tool} 已执行 {int(now - agent.pending_tool_since)}s"
+                else:
+                    busy = "当前模型思考中"
+                # ❗心跳本身不能重置空闲时钟（push_stream 会刷 last_activity），
+                #   否则每 60s 自我续命 → 空闲卡死判定永不触发。故播报后还原。
+                _keep = agent.last_activity
+                agent.push_stream(
+                    "info", f"⏳ 会话已执行 {int(elapsed)}s，{busy}，尚未完成，继续等待…")
+                agent.last_activity = _keep
+                self.world.dirty = True
+
+    @staticmethod
+    async def _cancel_and_drain(task):
+        """取消任务并吞掉收尾异常（用于超时/卡死强停）。"""
+        if task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except BaseException:
+            pass
+
+    @staticmethod
+    def _extract_balanced(text):
+        """从文本中提取第一个大括号平衡的 JSON 对象子串（字符串/转义感知）。
+        只取到第一个配对的右括号，自然丢弃尾部拖的解释文字/第二个对象（治 Extra data）。
+        找不到平衡对象返回 None。"""
+        start = text.find("{")
+        if start < 0:
+            return None
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return text[start:i + 1]
+        return None      # 括号不平衡（输出被截断）
+
+    @staticmethod
+    def _repair_json(s):
+        """对常见 LLM 非法 JSON 做保守修复：转义字符串内裸控制符 + 去尾逗号。
+        仅在字符串内把裸换行/制表符/回车转义成 \\n \\t \\r（JSON 禁止串内裸控制符）。"""
+        out = []
+        in_str = False
+        esc = False
+        for ch in s:
+            if in_str:
+                if esc:
+                    out.append(ch)
+                    esc = False
+                elif ch == "\\":
+                    out.append(ch)
+                    esc = True
+                elif ch == '"':
+                    out.append(ch)
+                    in_str = False
+                elif ch == "\n":
+                    out.append("\\n")
+                elif ch == "\r":
+                    out.append("\\r")
+                elif ch == "\t":
+                    out.append("\\t")
+                else:
+                    out.append(ch)
+            else:
+                out.append(ch)
+                if ch == '"':
+                    in_str = True
+        repaired = "".join(out)
+        # 去掉对象/数组结尾的多余逗号： ,}  或  ,]
+        repaired = re.sub(r",(\s*[}\]])", r"\1", repaired)
+        return repaired
 
     @staticmethod
     def _parse_json(text):
-        text = text.strip()
-        m = re.search(r"\{[\s\S]*\}", text)
-        if not m:
-            raise ValueError(f"未找到 JSON：{text[:60]}")
-        return json.loads(m.group(0))
+        text = (text or "").strip()
+        # 去掉 markdown 代码围栏 ```json ... ```
+        if "```" in text:
+            m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, re.I)
+            if m:
+                text = m.group(1).strip()
+        candidate = TaskRunner._extract_balanced(text)
+        if candidate is None:
+            # 退化：贪婪取首个 { 到末个 }（处理括号被截断等边缘情况）
+            s, e = text.find("{"), text.rfind("}")
+            if s < 0 or e <= s:
+                raise ValueError(f"未找到 JSON：{text[:80]}")
+            candidate = text[s:e + 1]
+        # 1) 直接解析
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+        # 2) 修复后再解析（转义裸控制符 + 去尾逗号）
+        repaired = TaskRunner._repair_json(candidate)
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"JSON 解析失败（已尝试修复）：{str(e)[:50]}；片段：{candidate[:80]}"
+            ) from None

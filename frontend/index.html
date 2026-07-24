@@ -127,7 +127,10 @@
     </div>
     <div class="setField">
       <label>🧩 可使用的 Skill
-        <span class="skillAllWrap"><input type="checkbox" id="setSkillAll" />全部启用</span>
+        <span class="skillCtrls">
+          <button type="button" id="setSkillRefresh" class="skillRefresh" title="重新扫描本机已安装的 Skill">🔄 刷新</button>
+          <span class="skillAllWrap"><input type="checkbox" id="setSkillAll" />全部启用</span>
+        </span>
       </label>
       <div id="setSkills" class="skillList"></div>
     </div>

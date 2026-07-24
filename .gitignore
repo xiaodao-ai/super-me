@@ -2,6 +2,7 @@
 __pycache__/
 backend/__pycache__/
 backend/data/
+backend/logs/
 *.pyc
 .DS_Store
 .canvas-snap.jpg

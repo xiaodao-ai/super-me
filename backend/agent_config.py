@@ -257,6 +257,9 @@ async def list_models(refresh=False) -> list:
             auth=qodercli_auth(),
             cwd=str(DATA_DIR.parent),
             tools=[], max_turns=1,
+            # 给一个 stderr 回调：让内置 qodercli 的 stderr（如 git 探测的 fatal）
+            # 被 PIPE 后吁掉，不再继承到控制台刷屏。
+            stderr=lambda _line: None,
         )
         client = QoderSDKClient(options=opts)
         await asyncio.wait_for(client.connect(None), timeout=60)

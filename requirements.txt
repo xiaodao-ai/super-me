@@ -1,8 +1,11 @@
 # super-me 后端依赖
 # 安装：python3 -m pip install -r requirements.txt
 # 国内镜像：python3 -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+#
+# 说明：后端仅依赖以下两个第三方库，其余（asyncio / contextvars / pathlib /
+# threading / json 等）均为 Python 标准库，无需安装。
 
-# Web 服务 / WebSocket 广播
+# Web 服务 / WebSocket 广播 / 静态托管
 aiohttp>=3.13,<4
 
 # 驱动分身真实执行任务的 Agent SDK（自动带入 mcp、pydantic 等依赖）

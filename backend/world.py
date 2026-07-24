@@ -11,6 +11,7 @@ import time
 
 from personas import PERSONAS, MEETING_CENTER, MEETING_RADIUS, PANTRY
 import agent_config as _agent_config
+import run_log
 
 TICK_HZ = 10
 _id_counter = itertools.count(1)
@@ -200,19 +201,29 @@ class Agent:
         self.hint_log = []           # 插话历史（供复盘沉淀）
         self.exec_task = None        # 正在执行的 SDK 会话（可被插话中断）
         self.interrupted = False
+        self.last_activity = 0.0     # 最近一次流事件时间（monotonic），用于空闲/卡死判定
+        self.pending_tool = ""       # 当前正在执行的工具名（非空=工具执行中，静默属正常）
+        self.pending_tool_since = 0.0  # 当前工具开始执行的时刻（monotonic），供心跳展示工具自身耗时
 
     def push_stream(self, kind, text):
         """记录一条 SDK 会话流事件。kind: info/text/tool/ret/result/error"""
+        self.last_activity = time.monotonic()   # 任何流事件都算"还在产出"，刷新活动时间
         self.stream_seq += 1
         self.stream.append({
             "seq": self.stream_seq,
             "t": time.strftime("%H:%M:%S"),
             "k": kind,
             "tag": self.stream_tag,
-            "txt": str(text)[:400],
+            "txt": str(text)[:2000],
         })
         if len(self.stream) > 400:
             self.stream = self.stream[-400:]
+        # 持久化一份到磁盘（不截断，供事后复盘）
+        try:
+            run_log.write("stream", agent=self.id, tag=self.stream_tag,
+                          level=kind, txt=str(text)[:4000])
+        except Exception:
+            pass
 
     def stream_since(self, since):
         return [e for e in self.stream if e["seq"] > since]
@@ -306,6 +317,11 @@ class World:
                     for st in p.steps:
                         if st.status in ("pending", "running"):
                             st.status = "failed"
+                        # 同步重置 step 内部未完成的 assign（否则遗留 running
+                        # 僵尸状态，retry 时重置不到 → 不跑任务直接秒挂）
+                        for a in st.assigns:
+                            if a.status in ("pending", "running"):
+                                a.status = "failed"
             # 让 id 生成器跳过已有 id
             top = max([t.id for t in self.tasks] +
                       [s.id for t in self.tasks for s in t.subtasks] +
@@ -320,6 +336,10 @@ class World:
         self.events.append({"t": time.strftime("%H:%M:%S"), "text": text})
         if len(self.events) > 120:
             self.events = self.events[-120:]
+        try:
+            run_log.write("event", text=str(text))
+        except Exception:
+            pass
         self.dirty = True
 
     # ── 真实分发动画（由 runner 触发）─────────────────────

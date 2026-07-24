@@ -11,11 +11,15 @@
 - **真实执行**：任务由 `qoder_agent_sdk` 驱动真实 LLM 会话，成员在 `workspace/` / `projects/` 里产出可运行的真实文件，非模拟。
 - **TL 智能拆解**：把需求发给「队长桑」，它会真实拆解为子任务并按阶段（开发 → 测试 → 评审）分批调度。
 - **项目督导模式**：复杂需求可立项，队长规划多步骤计划、逐步验收、不达标打回返工，直到结项。
+- **验收看真凭实据**：验收时以磁盘实测（`ls`/文件字节数）为最高判据，成员自述与证据冲突时以证据为准，杜绝「嘴上说做了、盘上没东西」。
+- **项目追加需求**：已完成的项目可随时追加新需求，队长在既有产出之上规划新增步骤继续推进，不重复造轮子。
 - **需求澄清 / 执行插话**：开工前队长会就关键问题向你提问；执行中可随时插话纠正，会中断当前会话并按你的话重跑。
 - **自进化**：任务/项目复盘后自动为成员沉淀可复用规则，写入各自配置。
-- **3D 可视化**：WebGPU 渲染的俯视办公室，实时展示分身移动、气泡、任务流转动画与协作动态。
+- **健壮的 JSON 解析**：拆解/规划/验收的 LLM 输出先本地修复，失败再交由 LLM 重排为严格 JSON，最大限度避免因格式问题中断。
+- **执行日志留痕**：项目 / 任务 / LLM / 分身四类日志分门别类落盘到 `backend/logs/`，随时回溯完整时间线与原始 prompt/response。
+- **3D 可视化**：WebGPU 渲染的俯视办公室，实时展示分身移动、气泡、任务流转动画与协作动态（前端限帧降 CPU）。
 - **可配置**：每个分身可独立设置工作目录、可用 Skill、附加规则、指定模型、是否允许执行 Shell 命令。
-- **定时任务 & 自定义 Agent**：支持给分身配置周期性任务，也支持新增自定义角色。
+- **定时任务 & 自定义 Agent**：支持给分身配置周期性任务（含畸形数据容错），也支持新增自定义角色。
 - **本地持久化**：世界状态（任务/事件/完成数）落盘到 `backend/data/state.json`，重启自动恢复。
 
 ---
@@ -24,7 +28,7 @@
 
 | Emoji | 名称 | 角色 | 职责 |
 |------|--------|------|------|
-| 👑 | 队长桑 | TL · 技术负责人 | 拆解需求、规划项目、验收督导、复盘沉淀 |
+| 👑 | 队长桑 | TL · 技术负责人 | 拆解需求、规划项目、追加规划、验收督导、复盘沉淀 |
 | 💻 | 全栈君 | 开发 · 全栈工程师 | 前后端一肩挑，产出真实代码文件 |
 | 🐞 | 测试喵 | 测试 · 质量工程师 | 编写测试用例/验收清单，产出 `TEST_REPORT.md` |
 | 🕵️ | 检查官 | 检查员 · 代码评审官 | 从正确性/可读性/风险评审，产出 `REVIEW.md` |
@@ -40,11 +44,12 @@ super-me/
 ├── backend/                # Python + aiohttp 服务端
 │   ├── server.py           # 入口：静态托管 + /ws 广播 + REST API
 │   ├── world.py            # 世界状态模型（Agent / Task / Project / 事件）
-│   ├── runner.py           # 任务编排器：驱动 SDK 真实执行、拆解、验收、返工
-│   ├── personas.py         # 分身人设 + 各类 LLM 提示词模板
+│   ├── runner.py           # 任务编排器：驱动 SDK 真实执行、拆解、验收、返工、追加
+│   ├── personas.py         # 分身人设 + 各类 LLM 提示词模板（拆解/规划/追加/验收/JSON 修复）
 │   ├── agent_config.py     # 每个分身的配置（目录/Skill/规则/模型/并发）
 │   ├── project_memory.py   # 项目级记忆的读写
-│   ├── scheduler.py        # 定时任务调度
+│   ├── run_log.py          # 执行日志：项目/任务/LLM/分身四类日志落盘 logs/
+│   ├── scheduler.py        # 定时任务调度（含脏数据容错）
 │   ├── storage.py          # 状态落盘 data/state.json
 │   └── smoke_*.py          # SDK / 计划 / 模型的冒烟自测脚本
 ├── frontend/               # WebGPU 前端（无构建，原生 ESM）
@@ -109,6 +114,7 @@ python3 server.py
 
 - **派任务**：选接收人 + 填任务内容。发给「队长桑」会先拆解再分派，产出在 `workspace/task-N/`。
 - **发项目**：填项目名/描述/文件夹名，选参与成员，队长规划多步骤并督导推进，产出在 `projects/<folder>/shared/`。
+- **追加需求**：对已完成的项目继续提需求，队长在既有产出上规划新增步骤推进。
 - **澄清问答**：队长弹出问题时选择候选项作答，或跳过让队长自行拍板。
 - **执行插话**：点开分身终端，在执行中输入纠正内容立即生效。
 - **配置分身**：点分身设置专属目录、Skill、规则、模型、并发与定时任务。
@@ -124,12 +130,16 @@ python3 server.py
 | POST | `/api/task` | 发布任务 `{assignee, title}` |
 | POST | `/api/task/{tid}/followup` | 对已完成/失败任务追问 |
 | POST | `/api/project` | 立项 `{title, desc, folder, members}` |
-| POST | `/api/project/{pid}/cancel\|delete\|retry` | 终止 / 删除 / 重试项目 |
+| POST | `/api/project/{pid}/cancel` | 终止进行中的项目 |
+| POST | `/api/project/{pid}/delete` | 删除项目（可选删除产出文件） |
+| POST | `/api/project/{pid}/retry` | 从失败步骤重试项目 |
+| POST | `/api/project/{pid}/extend` | 对已完成项目追加新需求 `{message}` |
 | GET/POST/DELETE | `/api/project/{pid}/memory` | 项目记忆增删查 |
 | POST | `/api/answer` | 回答队长澄清 `{kind, id, answers}` |
 | POST | `/api/interject` | 执行中插话纠正 `{aid, hint}` |
 | GET | `/api/stream/{aid}` | 拉取某分身的会话流式日志 |
 | GET/POST | `/api/config[/{aid}]` | 读取/保存分身或全局配置 |
+| GET | `/api/skills` | 本机可用 Skill 列表（`?refresh=1` 强制重扫，按需加载） |
 | GET/POST/DELETE | `/api/agents` | 自定义 Agent 列表/新增/删除 |
 | GET/POST/PUT/DELETE | `/api/schedules` | 定时任务管理 |
 
@@ -141,6 +151,14 @@ python3 server.py
 
 - **状态持久化**：`backend/data/state.json`（任务/项目/事件/完成数），重启自动恢复；中断的任务会被标记为失败。
 - **配置**：`backend/data/agents_config.json`。
+- **执行日志**：`backend/logs/`，按类别分目录：
+  - `projects/project-<id>.log` — 每个项目的完整时间线
+  - `tasks/task-<id>.log` — 每个任务的完整时间线
+  - `llm/llm-YYYYMMDD.log` — 当天所有 LLM 调用的原始 prompt/response
+  - `agents/<agent>-YYYYMMDD.log` — 每个分身当天的动作流
+  - `system/system-YYYYMMDD.log` — 无归属的系统事件兜底
+
+  日志默认保留 14 天，超期自动清理；写入异常被吞掉，绝不影响主执行流程。
 - **任务产出**：`workspace/task-N/`。
 - **项目产出**：`projects/<folder>/shared/`（公共交付）、`projects/<folder>/members/<role>/`（个人草稿）。
 
@@ -165,7 +183,8 @@ python3 smoke_models.py   # 列出账号可用模型
 
 - **打开页面提示不支持 WebGPU**：请升级到最新版 Chrome / Edge / Safari。
 - **任务一直失败 / 鉴权错误**：确认已安装 Qoder 并登录，`qodercli` 命令可用。
-- **Skill 列表为空**：说明本机没有 `qodercli` 或未安装任何 Skill。
+- **Skill 列表为空**：说明本机没有 `qodercli` 或未安装任何 Skill；可在设置页点「刷新」按需重扫。
+- **想排查执行细节**：直接翻阅 `backend/logs/` 下对应项目/任务/LLM 的日志文件。
 - **端口被占用**：`server.py` 中 `web.run_app(..., port=8787)` 可自行修改端口。
 
 ---

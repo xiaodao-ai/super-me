@@ -189,6 +189,25 @@ export class UI {
     this.termBackdrop = document.getElementById("termBackdrop");
     this.termHead = document.getElementById("termHead");
     this.termBody = document.getElementById("termBody");
+    // 会话流长行：复制按钮 + 点击展开/收起（委托，只绑一次）
+    this.termBody.addEventListener("click", async (e) => {
+      const copyBtn = e.target.closest(".tCopy");
+      if (copyBtn) {
+        const txtEl = copyBtn.closest(".tLine")?.querySelector(".tTxt");
+        if (txtEl) {
+          try {
+            await navigator.clipboard.writeText(txtEl.textContent);
+            copyBtn.textContent = "✓";
+            setTimeout(() => { copyBtn.textContent = "⧉"; }, 1200);
+          } catch { copyBtn.textContent = "✗"; }
+        }
+        return;   // 不触发展开/收起
+      }
+      const el = e.target.closest(".tTxt.clip, .tTxt.open");
+      if (!el) return;
+      el.classList.toggle("open");
+      el.classList.toggle("clip");
+    });
     this.termFollow = document.getElementById("termFollowCk");
     this.termFilter = document.getElementById("termFilter");
     this.termId = null;
@@ -260,7 +279,10 @@ export class UI {
             const chip = it.tag
               ? `<i class="tTag" style="color:${UI.#tagColor(it.tag)}">${esc(it.tag)}</i>`
               : "";
-            div.innerHTML = `<time>${it.t}</time>${chip}<span>${esc(it.txt)}</span>`;
+            const long = (it.txt || "").length > 160 || (it.txt || "").includes("\n");
+            const cls = long ? "tTxt clip" : "tTxt";
+            const copyBtn = long ? `<button class="tCopy" title="复制完整内容">⧉</button>` : "";
+            div.innerHTML = `<time>${it.t}</time>${chip}<span class="${cls}" title="${long ? '点击展开/收起' : ''}">${esc(it.txt)}</span>${copyBtn}`;
             this.termBody.appendChild(div);
             if (it.tag) this.#addTermTag(it.tag);
           }
@@ -436,6 +458,7 @@ export class UI {
     this.setWorkdir = document.getElementById("setWorkdir");
     this.setSkillAll = document.getElementById("setSkillAll");
     this.setSkills = document.getElementById("setSkills");
+    this.setSkillRefresh = document.getElementById("setSkillRefresh");
     this.setRules = document.getElementById("setRules");
     this.setModel = document.getElementById("setModel");
     this.setCtx = document.getElementById("setCtx");
@@ -453,6 +476,8 @@ export class UI {
     this.setBackdrop.onclick = close;
     this.setSkillAll.onchange = () =>
       this.setSkills.classList.toggle("disabled", this.setSkillAll.checked);
+    if (this.setSkillRefresh)
+      this.setSkillRefresh.onclick = () => this.#loadSkills(true);
     this.setSave.onclick = () => this.#saveSettings();
     // 模型切换 → 联动可选上下文窗口
     this.setModel.onchange = () => this.#fillCtxOptions("");
@@ -570,14 +595,8 @@ export class UI {
       const all = (cfg.skills || []).includes("all");
       this.setSkillAll.checked = all;
       this.setSkills.classList.toggle("disabled", all);
-      this.setSkills.innerHTML = data.skills.length
-        ? data.skills.map((s) => `
-          <label class="skillItem">
-            <input type="checkbox" value="${esc(s.name)}"
-              ${(cfg.skills || []).includes(s.name) ? "checked" : ""} />
-            <span>${esc(s.name)}</span><small>${esc(s.desc || "")}</small>
-          </label>`).join("")
-        : '<p style="font-size:12px;color:var(--ink-soft)">本机没有发现已安装的 Skill</p>';
+      this.curCfg = cfg;                 // 供 Skill 按需加载时回显已选
+      this.#loadSkills();                // 非阻塞：配置已就绪，Skill 单独异步拉取（不再拖慢配置显示）
     } catch {
       this.setSkills.innerHTML =
         '<p style="font-size:12px;color:#e0608a">配置加载失败</p>';
@@ -587,11 +606,55 @@ export class UI {
     document.getElementById("cronAddBtn").onclick = () => this.#addCronJob(id);
   }
 
+  #renderSkills(skills, checkedNames) {
+    const checked = new Set(checkedNames || []);
+    this.setSkills.innerHTML = (skills && skills.length)
+      ? skills.map((s) => `
+        <label class="skillItem">
+          <input type="checkbox" value="${esc(s.name)}"
+            ${checked.has(s.name) ? "checked" : ""} />
+          <span>${esc(s.name)}</span><small>${esc(s.desc || "")}</small>
+        </label>`).join("")
+      : '<p style="font-size:12px;color:var(--ink-soft)">本机没有发现已安装的 Skill（点“刷新”重新扫描）</p>';
+  }
+
+  async #loadSkills(refresh = false) {
+    const id = this.settingsId;
+    if (!id) return;
+    // 记住当前勾选（含用户临时改动）；首次加载则回显配置里已选的
+    const prev = [...this.setSkills.querySelectorAll("input[type=checkbox]:checked")]
+      .map((i) => i.value);
+    const checkedNames = prev.length
+      ? prev
+      : ((this.curCfg && this.curCfg.skills) || []);
+    this.setSkills.innerHTML =
+      `<p style="font-size:12px;color:var(--ink-soft)">${refresh ? "刷新中…" : "加载中…"}</p>`;
+    if (this.setSkillRefresh) this.setSkillRefresh.disabled = true;
+    try {
+      const r = await fetch(`/api/skills${refresh ? "?refresh=1" : ""}`);
+      const d = await r.json();
+      if (this.settingsId !== id) return;      // 期间切换了目标分身
+      this.#renderSkills(d.skills || [], checkedNames);
+    } catch {
+      if (this.settingsId === id)
+        this.setSkills.innerHTML =
+          '<p style="font-size:12px;color:#e0608a">Skill 加载失败，点“刷新”重试</p>';
+    } finally {
+      if (this.setSkillRefresh) this.setSkillRefresh.disabled = false;
+    }
+  }
+
   async #saveSettings() {
     if (!this.settingsId) return;
-    const skills = this.setSkillAll.checked
-      ? ["all"]
-      : [...this.setSkills.querySelectorAll("input:checked")].map((i) => i.value);
+    // Skill 列表可能尚未异步加载完；此时保留原有选择，避免误存为空清掉配置
+    let skills;
+    if (this.setSkillAll.checked) {
+      skills = ["all"];
+    } else if (this.setSkills.querySelector("input[type=checkbox]")) {
+      skills = [...this.setSkills.querySelectorAll("input:checked")].map((i) => i.value);
+    } else {
+      skills = (this.curCfg && this.curCfg.skills) || [];
+    }
     this.setSave.disabled = true;
     this.setMsg.textContent = "保存中…";
     this.setMsg.style.color = "var(--ink-soft)";
@@ -1255,6 +1318,15 @@ export class UI {
         <button class="followupBtn">🔄 重试</button>
       </div>`;
     }
+    // 已完成的项目：追加需求（队长会规划新增步骤继续做）
+    if (p.status === "done") {
+      html += `
+      <div class="followupRow">
+        <input class="followupInput extendInput" type="text" maxlength="800"
+               placeholder="➕ 追加新需求，队长会拆解新步骤继续做…" />
+        <button class="followupBtn extendBtn">➕ 追加</button>
+      </div>`;
+    }
     const body = document.getElementById("projDetailBody");
     body.innerHTML = html;
     // 绑定重试输入框事件
@@ -1283,6 +1355,34 @@ export class UI {
       };
       retryFuBtn.onclick = sendRetry;
       retryInput.onkeydown = (e) => { if (e.key === "Enter") sendRetry(); };
+    }
+    // 已完成项目：追加需求 → 队长重新拆解继续做
+    const extInput = body.querySelector(".extendInput");
+    const extBtn = body.querySelector(".extendBtn");
+    if (extBtn && p.status === "done") {
+      const sendExtend = async () => {
+        const message = extInput.value.trim();
+        if (!message) { extInput.focus(); return; }
+        extBtn.disabled = true;
+        extBtn.textContent = "规划中…";
+        try {
+          const d = await (await fetch(`/api/project/${p.id}/extend`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message }),
+          })).json();
+          if (d.ok) {
+            extInput.value = "";
+            this._projDetailSig = "";  // 强制重绘
+          } else {
+            alert(d.error || "追加失败");
+          }
+        } catch { alert("网络出错了…"); }
+        extBtn.disabled = false;
+        extBtn.textContent = "➕ 追加";
+      };
+      extBtn.onclick = sendExtend;
+      extInput.onkeydown = (e) => { if (e.key === "Enter") sendExtend(); };
     }
   }
 

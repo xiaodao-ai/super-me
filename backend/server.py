@@ -16,10 +16,7 @@ import weakref
 from aiohttp import web, WSMsgType
 
 # 调试：kill -USR1 <pid> 可打印所有线程调用栈，排查事件循环阻塞
-# SIGUSR1 仅在类 Unix 平台存在，Windows 上跳过
-if hasattr(signal, "SIGUSR1"):
-    if hasattr(signal, "SIGUSR1"):
-        faulthandler.register(signal.SIGUSR1)
+faulthandler.register(signal.SIGUSR1)
 
 import storage
 import agent_config
@@ -154,6 +151,30 @@ async def project_retry_handler(request):
     hint = (data.get("message") or "").strip()[:300]
     runner.proj_tasks[proj.id] = asyncio.get_event_loop().create_task(
         runner.retry_project(proj, hint=hint))
+    return web.json_response({"ok": True, "title": proj.title})
+
+
+async def project_extend_handler(request):
+    """对已完成的项目追加新需求：队长规划新增步骤并继续推进。body: {message}"""
+    try:
+        pid = int(request.match_info["pid"])
+    except ValueError:
+        return web.json_response({"ok": False, "error": "bad id"}, status=400)
+    proj = next((p for p in world.projects if p.id == pid), None)
+    if not proj:
+        return web.json_response({"ok": False, "error": "项目不存在"}, status=404)
+    if proj.status != "done":
+        return web.json_response(
+            {"ok": False, "error": "只有已完成的项目才能追加需求"}, status=400)
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    message = (data.get("message") or "").strip()[:800]
+    if not message:
+        return web.json_response({"ok": False, "error": "请填写追加需求"}, status=400)
+    runner.proj_tasks[proj.id] = asyncio.get_event_loop().create_task(
+        runner.extend_project(proj, message))
     return web.json_response({"ok": True, "title": proj.title})
 
 
@@ -382,16 +403,22 @@ async def stream_handler(request):
 
 
 async def config_get(_request):
-    """全部分身配置 + 本机可用 Skill / 模型列表（每次打开刷新）。"""
-    skills = await agent_config.list_skills(refresh=True)
-    models = await agent_config.list_models(refresh=True)
+    """全部分身配置 + 可用模型列表；Skill 改为按需加载（见 /api/skills），
+    不再每次打开都强制重扫，避免配置显示被 Skill 扫描拖慢。"""
+    models = await agent_config.list_models()      # 用启动预热的缓存，秒返
     return web.json_response({
         "ok": True,
         "agents": {a.id: agent_config.get(a.id) for a in world.agents},
         "global": agent_config.get_global(),
-        "skills": skills,
         "models": models,
     })
+
+
+async def skills_get(request):
+    """本机可用 Skill 列表；?refresh=1 强制重扫（供设置页“刷新”按钮按需调用）。"""
+    refresh = request.query.get("refresh") in ("1", "true", "yes")
+    skills = await agent_config.list_skills(refresh=refresh)
+    return web.json_response({"ok": True, "skills": skills})
 
 
 async def config_post(request):
@@ -639,6 +666,7 @@ def main():
     app.router.add_post("/api/project/{pid}/cancel", project_cancel_handler)
     app.router.add_post("/api/project/{pid}/delete", project_delete_handler)
     app.router.add_post("/api/project/{pid}/retry", project_retry_handler)
+    app.router.add_post("/api/project/{pid}/extend", project_extend_handler)
     app.router.add_get("/api/project/{pid}/memory", project_memory_get)
     app.router.add_post("/api/project/{pid}/memory", project_memory_post)
     app.router.add_delete("/api/project/{pid}/memory/{idx}", project_memory_delete)
@@ -650,6 +678,7 @@ def main():
     app.router.add_get("/api/stream/{aid}", stream_handler)
     app.router.add_get("/api/browse", browse_handler)
     app.router.add_get("/api/config", config_get)
+    app.router.add_get("/api/skills", skills_get)
     app.router.add_post("/api/config/{aid}", config_post)
     app.router.add_post("/snap", snap_handler)
     app.router.add_get("/api/agents", agents_list_handler)
