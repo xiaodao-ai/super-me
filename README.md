@@ -6,6 +6,9 @@
 
 ---
 
+<img width="3018" height="1530" alt="图片" src="https://github.com/user-attachments/assets/e2af85a6-0bea-4c2f-bb21-d710d36d4768" />
+
+
 ## ✨ 特性
 
 - **真实执行**：任务由 `qoder_agent_sdk` 驱动真实 LLM 会话，成员在 `workspace/` / `projects/` 里产出可运行的真实文件，非模拟。
